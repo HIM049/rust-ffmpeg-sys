@@ -252,7 +252,11 @@ fn find_sysroot() -> Option<String> {
             .expect("failed to run xcrun");
 
         if !xcode_output.status.success() {
-            panic!("Failed to run xcrun to get the {} sysroot, please install xcode tools or provide sysroot using $SYSROOT env. Error: {}", sdk, String::from_utf8_lossy(&xcode_output.stderr));
+            panic!(
+                "Failed to run xcrun to get the {} sysroot, please install xcode tools or provide sysroot using $SYSROOT env. Error: {}",
+                sdk,
+                String::from_utf8_lossy(&xcode_output.stderr)
+            );
         }
 
         let string = String::from_utf8(xcode_output.stdout)
@@ -313,8 +317,10 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         includes.push(source_dir.clone());
         let new_include = env::join_paths(includes).unwrap();
 
-        env::set_var("PATH", &new_path);
-        env::set_var("INCLUDE", &new_include);
+        unsafe {
+            env::set_var("PATH", &new_path);
+            env::set_var("INCLUDE", &new_include);
+        }
     }
 
     // Command's path is not relative to command's current_dir
@@ -802,7 +808,9 @@ fn try_vcpkg(_statik: bool) -> Option<Vec<PathBuf>> {
 #[cfg(target_env = "msvc")]
 fn try_vcpkg(statik: bool) -> Option<Vec<PathBuf>> {
     if !statik {
-        env::set_var("VCPKGRS_DYNAMIC", "1");
+        unsafe {
+            env::set_var("VCPKGRS_DYNAMIC", "1");
+        }
     }
 
     vcpkg::find_package("ffmpeg")
@@ -853,7 +861,7 @@ fn check_features(
         );
     }
 
-    let version_check_info = [("avcodec", 56, 63, 0, 108)];
+    let version_check_info = [("avcodec", 56, 64, 0, 108)];
     for &(lib, begin_version_major, end_version_major, begin_version_minor, end_version_minor) in
         version_check_info.iter()
     {
@@ -1002,6 +1010,7 @@ fn check_features(
         ("ffmpeg_7_1", 61, 19),
         ("ffmpeg_8_0", 62, 8),
         ("ffmpeg_8_1", 62, 28),
+        ("ffmpeg_9_0", 63, 1),
     ];
     for &(ffmpeg_version_flag, lavc_version_major, lavc_version_minor) in
         ffmpeg_lavc_versions.iter()
@@ -1066,6 +1075,8 @@ fn link_to_libraries(statik: bool) {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+
     let statik = env::var("CARGO_FEATURE_STATIC").is_ok();
     let ffmpeg_major_version: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
 
@@ -1704,6 +1715,7 @@ fn main() {
             non_exhaustive: env::var("CARGO_FEATURE_NON_EXHAUSTIVE_ENUMS").is_ok(),
         })
         .prepend_enum_name(false)
+        .wrap_unsafe_ops(true)
         .derive_eq(true)
         .size_t_is_usize(true)
         .parse_callbacks(Box::new(Callbacks));
@@ -1812,6 +1824,11 @@ fn main() {
         .header(search_include(&include_paths, "libavutil/twofish.h"))
         .header(search_include(&include_paths, "libavutil/avutil.h"))
         .header(search_include(&include_paths, "libavutil/xtea.h"));
+
+    let raw_color_params_path = search_include(&include_paths, "libavutil/raw_color_params.h");
+    if std::path::Path::new(&raw_color_params_path).exists() {
+        builder = builder.header(raw_color_params_path);
+    }
 
     if env::var("CARGO_FEATURE_POSTPROC").is_ok() {
         let postproc_path = search_include(&include_paths, "libpostproc/postprocess.h");
