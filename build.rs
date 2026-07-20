@@ -646,10 +646,10 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     {
         configure.arg("--enable-videotoolbox");
 
-        if target != host {
-            if let Some(flag) = apple_version_min_cflag(&target_os, is_sim) {
-                configure.arg(format!("--extra-cflags={flag}"));
-            }
+        if target != host
+            && let Some(flag) = apple_version_min_cflag(&target_os, is_sim)
+        {
+            configure.arg(format!("--extra-cflags={flag}"));
         }
     }
 
@@ -659,10 +659,10 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     {
         configure.arg("--enable-audiotoolbox");
 
-        if target != host {
-            if let Some(flag) = apple_version_min_cflag(&target_os, is_sim) {
-                configure.arg(format!("--extra-cflags={flag}"));
-            }
+        if target != host
+            && let Some(flag) = apple_version_min_cflag(&target_os, is_sim)
+        {
+            configure.arg(format!("--extra-cflags={flag}"));
         }
     }
 
@@ -829,10 +829,10 @@ fn check_features(
     let mut main_code = String::new();
 
     for &(header, feature, var) in infos {
-        if let Some(feature) = feature {
-            if env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err() {
-                continue;
-            }
+        if let Some(feature) = feature
+            && env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err()
+        {
+            continue;
         }
 
         let include = format!("#include <{header}>");
@@ -937,10 +937,10 @@ fn check_features(
     println!("stdout of {}={}", executable.display(), stdout);
 
     for &(_, feature, var) in infos {
-        if let Some(feature) = feature {
-            if env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err() {
-                continue;
-            }
+        if let Some(feature) = feature
+            && env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err()
+        {
+            continue;
         }
         // Here so the features are listed for rust-ffmpeg at build time. Does
         // NOT represent activated features, just features that exist (hence the
@@ -1229,17 +1229,17 @@ fn main() {
         }
 
         for (lib_name, env_variable_name) in libs.iter() {
-            if env::var(format!("CARGO_FEATURE_{env_variable_name}")).is_ok() {
-                if let Err(e) = pkg_config::Config::new().statik(statik).probe(lib_name) {
-                    eprintln!("error: FFmpeg library {} not found: {}", lib_name, e);
-                    eprintln!();
-                    eprintln!(
-                        "The {} library is required but could not be found.",
-                        lib_name
-                    );
-                    eprintln!("Please ensure FFmpeg is installed with all required components.");
-                    std::process::exit(1);
-                }
+            if env::var(format!("CARGO_FEATURE_{env_variable_name}")).is_ok()
+                && let Err(e) = pkg_config::Config::new().statik(statik).probe(lib_name)
+            {
+                eprintln!("error: FFmpeg library {} not found: {}", lib_name, e);
+                eprintln!();
+                eprintln!(
+                    "The {} library is required but could not be found.",
+                    lib_name
+                );
+                eprintln!("Please ensure FFmpeg is installed with all required components.");
+                std::process::exit(1);
             }
         }
 
@@ -1740,10 +1740,10 @@ fn main() {
         if ffmpeg_major_version < 5 {
             builder = builder.header(search_include(&include_paths, "libavcodec/vaapi.h"));
         }
-        if ffmpeg_major_version < 8 {
-            if let Some(avfft_path) = maybe_search_include(&include_paths, "libavcodec/avfft.h") {
-                builder = builder.header(avfft_path);
-            }
+        if ffmpeg_major_version < 8
+            && let Some(avfft_path) = maybe_search_include(&include_paths, "libavcodec/avfft.h")
+        {
+            builder = builder.header(avfft_path);
         }
     }
 
