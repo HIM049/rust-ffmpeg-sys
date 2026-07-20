@@ -633,7 +633,7 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     enable!(configure, "BUILD_LIB_WEBP", "libwebp");
     enable!(configure, "BUILD_LIB_X264", "libx264");
     enable!(configure, "BUILD_LIB_X265", "libx265");
-    enable!(configure, "BUILD_LIB_AVS", "libavs");
+    enable!(configure, "BUILD_LIB_XAVS", "libxavs");
     enable!(configure, "BUILD_LIB_XVID", "libxvid");
 
     // make sure to only enable related hw acceleration features for a correct
