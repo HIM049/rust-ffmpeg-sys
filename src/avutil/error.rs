@@ -49,6 +49,7 @@ pub const AVERROR_HTTP_BAD_REQUEST: c_int = FFERRTAG!(0xF8, b'4', b'0', b'0');
 pub const AVERROR_HTTP_UNAUTHORIZED: c_int = FFERRTAG!(0xF8, b'4', b'0', b'1');
 pub const AVERROR_HTTP_FORBIDDEN: c_int = FFERRTAG!(0xF8, b'4', b'0', b'3');
 pub const AVERROR_HTTP_NOT_FOUND: c_int = FFERRTAG!(0xF8, b'4', b'0', b'4');
+pub const AVERROR_HTTP_TOO_MANY_REQUESTS: c_int = FFERRTAG!(0xF8, b'4', b'2', b'9');
 pub const AVERROR_HTTP_OTHER_4XX: c_int = FFERRTAG!(0xF8, b'4', b'X', b'X');
 pub const AVERROR_HTTP_SERVER_ERROR: c_int = FFERRTAG!(0xF8, b'5', b'X', b'X');
 
@@ -58,11 +59,13 @@ pub unsafe fn av_make_error_string(
     errbuf_size: size_t,
     errnum: c_int,
 ) -> *mut c_char {
-    av_strerror(errnum, errbuf, errbuf_size);
+    unsafe {
+        av_strerror(errnum, errbuf, errbuf_size);
+    }
 
     errbuf
 }
 
-extern "C" {
+unsafe extern "C" {
     pub fn av_strerror(errnum: c_int, errbuf: *mut c_char, errbuf_size: size_t) -> c_int;
 }

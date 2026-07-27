@@ -7,7 +7,7 @@ use std::env;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str;
 
@@ -80,10 +80,10 @@ impl ParseCallbacks for Callbacks {
         let codec_flag_prefix = "AV_CODEC_FLAG_";
         let error_max_size = "AV_ERROR_MAX_STRING_SIZE";
 
-        if value >= i64::min_value() && _name.starts_with(ch_layout_prefix) {
+        if _name.starts_with(ch_layout_prefix) {
             Some(IntKind::ULongLong)
-        } else if value >= i32::min_value() as i64
-            && value <= i32::max_value() as i64
+        } else if value >= i32::MIN as i64
+            && value <= i32::MAX as i64
             && (_name.starts_with(codec_cap_prefix) || _name.starts_with(codec_flag_prefix))
         {
             Some(IntKind::UInt)
@@ -92,7 +92,7 @@ impl ParseCallbacks for Callbacks {
                 name: "usize",
                 is_signed: false,
             })
-        } else if value >= i32::min_value() as i64 && value <= i32::max_value() as i64 {
+        } else if value >= i32::MIN as i64 && value <= i32::MAX as i64 {
             Some(IntKind::Int)
         } else {
             None
@@ -138,7 +138,7 @@ fn version() -> String {
         .parse()
         .unwrap();
 
-    format!("{}.{}", major, minor)
+    format!("{major}.{minor}")
 }
 
 fn output() -> PathBuf {
@@ -151,7 +151,7 @@ fn source() -> PathBuf {
 
 fn search() -> PathBuf {
     let mut absolute = env::current_dir().unwrap();
-    absolute.push(&output());
+    absolute.push(output());
     absolute.push("dist");
 
     absolute
@@ -163,6 +163,11 @@ fn fetch() -> io::Result<()> {
     let _ = std::fs::remove_dir_all(output_base_path.join(&clone_dest_dir));
     let status = Command::new("git")
         .current_dir(&output_base_path)
+        .args(if cfg!(target_os = "windows") {
+            vec!["-c", "core.autocrlf=false"]
+        } else {
+            vec![]
+        })
         .arg("clone")
         .arg("--depth=1")
         .arg("-b")
@@ -174,7 +179,7 @@ fn fetch() -> io::Result<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(io::Error::new(io::ErrorKind::Other, "fetch failed"))
+        Err(io::Error::other("fetch failed"))
     }
 }
 
@@ -187,36 +192,324 @@ fn switch(configure: &mut Command, feature: &str, name: &str) {
     configure.arg(arg.to_string() + name);
 }
 
-fn build() -> io::Result<()> {
+fn is_apple_simulator() -> bool {
+    env::var("CARGO_CFG_TARGET_VENDOR").unwrap_or_default() == "apple"
+        && (env::var("CARGO_CFG_TARGET_ABI").unwrap_or_default() == "sim"
+            || env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default() == "x86_64")
+}
+
+fn apple_sdk_name(target_os: &str, is_sim: bool) -> Option<&'static str> {
+    match (target_os, is_sim) {
+        ("macos", _) => Some("macosx"),
+        ("ios", true) => Some("iphonesimulator"),
+        ("ios", false) => Some("iphoneos"),
+        ("tvos", true) => Some("appletvsimulator"),
+        ("tvos", false) => Some("appletvos"),
+        _ => None,
+    }
+}
+
+/// Returns the `-m*-version-min=` cflags for cross-compiling to Apple platforms.
+fn apple_version_min_cflag(target_os: &str, is_sim: bool) -> Option<&'static str> {
+    match (target_os, is_sim) {
+        ("ios", true) => Some("-mios-simulator-version-min=11.0"),
+        ("ios", false) => Some("-mios-version-min=11.0"),
+        ("macos", _) => Some("-mmacosx-version-min=10.11"),
+        ("tvos", true) => Some("-mappletvsimulator-version-min=13.0"),
+        ("tvos", false) => Some("-mappletvos-version-min=13.0"),
+        _ => None,
+    }
+}
+
+fn get_ffmpeg_target_os() -> String {
+    let cargo_target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    match cargo_target_os.as_str() {
+        "ios" | "tvos" => "darwin".to_string(),
+        _ => cargo_target_os,
+    }
+}
+
+/// Find the sysroot required for a cross compilation by ffmpeg **and** bindgen
+/// @see https://github.com/rust-lang/rust-bindgen/issues/1229
+fn find_sysroot() -> Option<String> {
+    if env::var("CARGO_FEATURE_BUILD").is_err() || env::var("HOST") == env::var("TARGET") {
+        return None;
+    }
+
+    if let Ok(sysroot) = env::var("SYSROOT") {
+        return Some(sysroot.to_string());
+    }
+
+    if matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("ios") | Ok("tvos")
+    ) {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let sdk = apple_sdk_name(&target_os, is_apple_simulator()).unwrap();
+        let xcode_output = Command::new("xcrun")
+            .args(["--sdk", sdk, "--show-sdk-path"])
+            .output()
+            .expect("failed to run xcrun");
+
+        if !xcode_output.status.success() {
+            panic!(
+                "Failed to run xcrun to get the {} sysroot, please install xcode tools or provide sysroot using $SYSROOT env. Error: {}",
+                sdk,
+                String::from_utf8_lossy(&xcode_output.stderr)
+            );
+        }
+
+        let string = String::from_utf8(xcode_output.stdout)
+            .expect("Failed to parse xcrun output")
+            .replace("\n", "");
+
+        if !Path::new(&string).exists() {
+            panic!("xcrun returned invalid sysroot path: {}", string);
+        }
+
+        return Some(string);
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        let sysroot_path = env::var("CARGO_NDK_SYSROOT_PATH").expect("Missing android sysroot path. For android cross compilation please use cargo-ndk which exposes all the required NDK paths throught env variables.");
+
+        if !Path::new(&sysroot_path).exists() {
+            panic!("Android sysroot path does not exists: {}", sysroot_path);
+        }
+
+        return Some(sysroot_path);
+    }
+
+    println!("cargo:warning=Detected cross compilation but sysroot not provided");
+    None
+}
+
+/// Validate a CPU flag value (e.g. from FFMPEG_MARCH/FFMPEG_MTUNE) before passing
+/// it to the compiler, to prevent arbitrary string injection.
+fn validated_cpu_flag(var: &str, value: String) -> String {
+    if value.is_empty() {
+        return value; // omit the flag
+    }
+    let valid = !value.starts_with('-')
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '+' | '_'));
+    if !valid {
+        panic!(
+            "Invalid {} value {:?}: only ASCII letters, digits and '-._+' are allowed \
+             (e.g. native, x86-64-v3, armv8.2-a+crc)",
+            var, value
+        );
+    }
+    value
+}
+
+fn build(sysroot: Option<&str>) -> io::Result<()> {
     let source_dir = source();
+    if cfg!(target_os = "windows") {
+        let path = env::var("PATH").unwrap_or_default();
+        let mut paths = env::split_paths(&path).collect::<Vec<_>>();
+        paths.push(source_dir.clone());
+        let new_path = env::join_paths(paths).unwrap();
+
+        let include = env::var("INCLUDE").unwrap_or_default();
+        let mut includes = env::split_paths(&include).collect::<Vec<_>>();
+        includes.push(source_dir.clone());
+        let new_include = env::join_paths(includes).unwrap();
+
+        unsafe {
+            env::set_var("PATH", &new_path);
+            env::set_var("INCLUDE", &new_include);
+        }
+    }
 
     // Command's path is not relative to command's current_dir
     let configure_path = source_dir.join("configure");
     assert!(configure_path.exists());
-    let mut configure = Command::new(&configure_path);
-    configure.current_dir(&source_dir);
+    let mut configure = if cfg!(target_os = "windows") {
+        if Command::new("sh")
+            .arg("-c")
+            .arg("echo ok")
+            .output()
+            .is_err()
+        {
+            return Err(io::Error::other(
+                "Failed to find 'sh.exe', which is required for building FFmpeg",
+            ));
+        }
 
+        let mut configure = Command::new("sh");
+        configure.arg(configure_path);
+        if cfg!(target_env = "msvc") {
+            configure.arg("--toolchain=msvc");
+        }
+
+        configure
+    } else {
+        Command::new(&configure_path)
+    };
+
+    configure.current_dir(&source_dir);
     configure.arg(format!("--prefix={}", search().to_string_lossy()));
 
-    if env::var("TARGET").unwrap() != env::var("HOST").unwrap() {
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
+    if target != host {
+        configure.arg("--enable-cross-compile");
+
         // Rust targets are subtly different than naming scheme for compiler prefixes.
         // The cc crate has the messy logic of guessing a working prefix,
         // and this is a messy way of reusing that logic.
         let cc = cc::Build::new();
-        let compiler = cc.get_compiler();
-        let compiler = compiler.path().file_stem().unwrap().to_str().unwrap();
-        let suffix_pos = compiler.rfind('-').unwrap(); // cut off "-gcc"
-        let prefix = compiler[0..suffix_pos].trim_end_matches("-wr"); // "wr-c++" compiler
 
-        configure.arg(format!("--cross-prefix={}-", prefix));
+        // Apple-clang needs this, -arch is not enough.
+        let target_flag = format!("--target={target}");
+        if cc.is_flag_supported(&target_flag).unwrap_or(false) {
+            configure.arg(format!("--extra-cflags={target_flag}"));
+            configure.arg(format!("--extra-ldflags={target_flag}"));
+        }
+
         configure.arg(format!(
             "--arch={}",
             env::var("CARGO_CFG_TARGET_ARCH").unwrap()
         ));
+        configure.arg(format!("--target-os={}", get_ffmpeg_target_os()));
+
+        // cross-prefix won't work for android because they use different compiler for every
+        // platform version, so we provide direct compiler paths manually instead
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("android") {
+            let compiler = cc.get_compiler();
+            if let Some(compiler_name) = compiler.path().file_stem().and_then(|s| s.to_str()) {
+                if let Some(suffix_pos) = compiler_name.rfind('-') {
+                    let prefix = compiler_name[0..suffix_pos].trim_end_matches("-wr"); // "wr-c++" compiler
+
+                    configure.arg(format!("--cross-prefix={prefix}-"));
+                }
+            } else {
+                eprintln!(
+                    "warning: Could not determine cross-compiler prefix from path: {:?}",
+                    compiler.path()
+                );
+            }
+        }
+    } else {
+        // Determine -march/-mtune flags for the compiler.
+        // Priority: env vars > build-portable feature > default (native)
+        println!("cargo:rerun-if-env-changed=FFMPEG_MARCH");
+        println!("cargo:rerun-if-env-changed=FFMPEG_MTUNE");
+
+        let march_env = env::var("FFMPEG_MARCH").ok();
+        let mtune_env = env::var("FFMPEG_MTUNE").ok();
+
+        let (march, mtune) = if march_env.is_some() || mtune_env.is_some() {
+            // Env vars take highest priority. Empty string means omit the flag.
+            // Validate the values to prevent arbitrary string injection.
+            (
+                validated_cpu_flag(
+                    "FFMPEG_MARCH",
+                    march_env.unwrap_or_else(|| "native".to_string()),
+                ),
+                validated_cpu_flag(
+                    "FFMPEG_MTUNE",
+                    mtune_env.unwrap_or_else(|| "native".to_string()),
+                ),
+            )
+        } else if cfg!(feature = "build-portable") {
+            // Omit both flags so the compiler uses its baseline target.
+            (String::new(), String::new())
+        } else {
+            // Default: tune for the host architecture.
+            ("native".to_string(), "native".to_string())
+        };
+
+        let mut parts = Vec::new();
+        if !march.is_empty() {
+            parts.push(format!("-march={march}"));
+        }
+        if !mtune.is_empty() {
+            parts.push(format!("-mtune={mtune}"));
+        }
+        if !parts.is_empty() {
+            configure.arg(format!("--extra-cflags={}", parts.join(" ")));
+        }
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // essential librareis on windowsw
+        println!("cargo:rustc-link-lib=dylib=ole32");
+        println!("cargo:rustc-link-lib=dylib=oleaut32");
+        println!("cargo:rustc-link-lib=dylib=gdi32");
+        println!("cargo:rustc-link-lib=dylib=user32");
+        println!("cargo:rustc-link-lib=dylib=vfw32");
+        println!("cargo:rustc-link-lib=dylib=strmiids");
+        println!("cargo:rustc-link-lib=dylib=bcrypt");
+        println!("cargo:rustc-link-lib=dylib=shlwapi");
+        println!("cargo:rustc-link-lib=dylib=shell32");
+    }
+
+    // for ios/tvos it is required to provide sysroot for both configure and bindgen
+    // for macos the easiest way is to run xcrun, for other platform we support $SYSROOT var
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let is_sim = is_apple_simulator();
+
+    if matches!(target_os.as_str(), "ios" | "tvos") {
+        let sdk = apple_sdk_name(&target_os, is_sim).unwrap();
+        let sysroot = sysroot.unwrap_or_else(|| panic!("The sysroot is required for {} cross compilation, make sure to have available xcode or provide the $SYSROOT env var", target_os));
+        configure.arg(format!("--sysroot={sysroot}"));
+
+        let cc = Command::new("xcrun")
+            .args(["--sdk", sdk, "-f", "clang"])
+            .output()
+            .expect("failed to run xcrun")
+            .stdout;
+
         configure.arg(format!(
-            "--target_os={}",
-            env::var("CARGO_CFG_TARGET_OS").unwrap()
+            "--cc={}",
+            str::from_utf8(&cc)
+                .expect("Failed to parse xcrun output")
+                .trim()
         ));
+    }
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
+        // cargo ndk auto populates rust env variables for android cross compilation
+        // so we can just leverage the same compiler path and cflags for ffmpeg build
+        let android_cc_raw_path = env::var(format!("CC_{target}")).expect("Missing CC path for android. Make sure to use cargo-ndk for adnrdoic cross compilation");
+        let android_cc_path = Path::new(&android_cc_raw_path);
+        if !android_cc_path.exists() {
+            panic!("Android CC path does not exists: {}", android_cc_raw_path);
+        }
+        configure.arg(format!("--cc={android_cc_raw_path}"));
+
+        for tool in ["nm", "strip"] {
+            configure.arg(format!(
+                "--{tool}={}",
+                android_cc_path
+                    .join("..")
+                    .join(format!("llvm-{tool}"))
+                    .canonicalize()
+                    .unwrap_or_else(|_| panic!("failed to resolve a path to android {}", tool))
+                    .display()
+            ));
+        }
+
+        if let Ok(android_target_flags) = env::var(format!("CFLAGS_{target}")).as_deref() {
+            configure.arg(format!("--extra-cflags={android_target_flags}"));
+            configure.arg(format!("--extra-ldflags={android_target_flags}"));
+        }
+
+        if matches!(
+            env::var("CARGO_CFG_TARGET_ARCH").as_deref(),
+            Ok("x86_64") | Ok("x86")
+        ) {
+            // x86 asm contains position dependent code (relocations)
+            configure.arg("--disable-asm");
+        }
+
+        // https://github.com/Javernaut/ffmpeg-android-maker/blob/master/scripts/ffmpeg/build.sh#L30
+        // configure.arg(--extra-ldflags=-WL,-z,max-page-size=16384");
+        // required for android
+        configure.arg("--extra-cflags=-fPIC");
     }
 
     // control debug build
@@ -226,12 +519,21 @@ fn build() -> io::Result<()> {
     } else {
         configure.arg("--disable-debug");
         configure.arg("--enable-stripping");
+        configure.arg("--extra-cflags=-03 -ffast-math -funroll-loops");
+        #[cfg(not(target_os = "windows"))]
+        configure.arg("--extra-ldflags=-flto");
     }
 
     // make it static
     configure.arg("--enable-static");
     configure.arg("--disable-shared");
+    // windows includes threading in the standard library
+    #[cfg(not(target_env = "msvc"))]
+    {
+        configure.arg("--enable-pthreads");
+    }
 
+    // position independent code
     configure.arg("--enable-pic");
 
     // stop autodetected libraries enabling themselves, causing linking errors
@@ -239,6 +541,9 @@ fn build() -> io::Result<()> {
 
     // do not build programs since we don't need them
     configure.arg("--disable-programs");
+
+    // do not generate documentation
+    configure.arg("--disable-doc");
 
     macro_rules! enable {
         ($conf:expr, $feat:expr, $name:expr) => {
@@ -272,6 +577,7 @@ fn build() -> io::Result<()> {
         .iter()
         .filter(|lib| lib.is_feature)
         .filter(|lib| !(lib.name == "avresample" && ffmpeg_major_version >= 5))
+        .filter(|lib| !(lib.name == "postproc" && ffmpeg_major_version >= 8))
     {
         switch(&mut configure, &lib.name.to_uppercase(), lib.name);
     }
@@ -327,8 +633,113 @@ fn build() -> io::Result<()> {
     enable!(configure, "BUILD_LIB_WEBP", "libwebp");
     enable!(configure, "BUILD_LIB_X264", "libx264");
     enable!(configure, "BUILD_LIB_X265", "libx265");
-    enable!(configure, "BUILD_LIB_AVS", "libavs");
+    enable!(configure, "BUILD_LIB_XAVS", "libxavs");
     enable!(configure, "BUILD_LIB_XVID", "libxvid");
+
+    // make sure to only enable related hw acceleration features for a correct
+    // target os. This allows to leave allows cargo features enable and control
+    // ffmpeg compilation using target only
+
+    // Apple VideoToolbox (iOS, macOS, and tvOS)
+    if env::var("CARGO_FEATURE_BUILD_VIDEOTOOLBOX").is_ok()
+        && matches!(target_os.as_str(), "ios" | "macos" | "tvos")
+    {
+        configure.arg("--enable-videotoolbox");
+
+        if target != host
+            && let Some(flag) = apple_version_min_cflag(&target_os, is_sim)
+        {
+            configure.arg(format!("--extra-cflags={flag}"));
+        }
+    }
+
+    // Apple audio hw acceleration API (iOS, macOS, and tvOS)
+    if env::var("CARGO_FEATURE_BUILD_AUDIOTOOLBOX").is_ok()
+        && matches!(target_os.as_str(), "ios" | "macos" | "tvos")
+    {
+        configure.arg("--enable-audiotoolbox");
+
+        if target != host
+            && let Some(flag) = apple_version_min_cflag(&target_os, is_sim)
+        {
+            configure.arg(format!("--extra-cflags={flag}"));
+        }
+    }
+
+    // Linux video acceleration API (VAAPI)
+    if env::var("CARGO_FEATURE_BUILD_VAAPI").is_ok() && matches!(target_os.as_str(), "linux") {
+        configure.arg("--enable-vaapi");
+    }
+
+    if env::var("CARGO_FEATURE_BUILD_LIB_D3D11VA").is_ok()
+        && matches!(target_os.as_str(), "windows")
+    {
+        configure.arg("--enable-d3d11va");
+    }
+
+    // DirectX Video Acceleration 2 (Windows only)
+    if env::var("CARGO_FEATURE_BUILD_LIB_DXVA2").is_ok() && matches!(target_os.as_str(), "windows")
+    {
+        configure.arg("--enable-dxva2");
+    }
+
+    // NVIDIA NVENC/NVDEC acceleration (Linux and Windows)
+    if env::var("CARGO_FEATURE_BUILD_NVIDIA").is_ok()
+        && matches!(target_os.as_str(), "linux" | "windows")
+    {
+        configure.arg("--enable-libnpp");
+        configure.arg("--enable-cuda-nvcc");
+        configure.arg("--enable-cuvid");
+        configure.arg("--enable-nvenc");
+        configure.arg("--enable-cuda-llvm");
+
+        let cuda_path = env::var("CUDA_PATH").unwrap_or(if target_os == "linux" {
+            "/usr/local/cuda".to_string()
+        } else {
+            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA".to_string()
+        });
+        println!("cargo:rustc-link-arg=-L{cuda_path}/lib64");
+        println!("cargo:rustc-link-arg=-I{cuda_path}/include");
+
+        // Additional configuration may be needed for CUDA toolkit path
+        // This could be provided as an environment variable
+        if let Ok(cuda_path) = env::var("CUDA_PATH") {
+            configure.arg(format!("--cuda-path={cuda_path}"));
+        }
+    }
+
+    // Intel Quick Sync Video (Linux and Windows)
+    if env::var("CARGO_FEATURE_BUILD_LIB_LIBMFX").is_ok()
+        && matches!(target_os.as_str(), "linux" | "windows")
+    {
+        configure.arg("--enable-libmfx");
+    }
+
+    // Android MediaCodec (Android only)
+    if env::var("CARGO_FEATURE_BUILD_MEDIACODEC").is_ok() && target_os == "android" {
+        configure.arg("--enable-mediacodec");
+        configure.arg("--enable-jni");
+
+        // Add common MediaCodec decoders
+        configure.arg("--enable-decoder=h264_mediacodec");
+        configure.arg("--enable-decoder=hevc_mediacodec");
+        configure.arg("--enable-decoder=vp8_mediacodec");
+        configure.arg("--enable-decoder=vp9_mediacodec");
+        configure.arg("--enable-decoder=av1_mediacodec");
+    }
+
+    // AMD Advanced Media Framework (Linux and Windows)
+    if env::var("CARGO_FEATURE_BUILD_AMF").is_ok()
+        && matches!(target_os.as_str(), "linux" | "windows")
+        && matches!(
+            env::var("CARGO_FEATURE_TARGET_ARCH").as_deref(),
+            Ok("x86_64")
+        )
+    {
+        configure.arg("--enable-amf");
+    }
+
+    enable!(configure, "BUILD_VULKAN", "vulkan");
 
     // other external libraries
     enable!(configure, "BUILD_LIB_DRM", "libdrm");
@@ -341,41 +752,49 @@ fn build() -> io::Result<()> {
     // configure misc build options
     enable!(configure, "BUILD_PIC", "pic");
 
+    // skip all the warnings from output as they can significantly slow down the build
+    // time on platforms like mac which spawns thousands of nullabilty complieance warnings
+    configure.arg("--extra-cflags=-w");
+
     // run ./configure
     let output = configure
         .output()
         .unwrap_or_else(|_| panic!("{:?} failed", configure));
     if !output.status.success() {
-        println!("configure: {}", String::from_utf8_lossy(&output.stdout));
+        println!(
+            "configure stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        println!(
+            "configure stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "configure failed {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "configure failed {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
 
     // run make
     if !Command::new("make")
         .arg("-j")
         .arg(num_cpus::get().to_string())
-        .current_dir(&source())
+        .current_dir(source())
         .status()?
         .success()
     {
-        return Err(io::Error::new(io::ErrorKind::Other, "make failed"));
+        return Err(io::Error::other("make failed"));
     }
 
     // run make install
     if !Command::new("make")
-        .current_dir(&source())
+        .current_dir(source())
         .arg("install")
         .status()?
         .success()
     {
-        return Err(io::Error::new(io::ErrorKind::Other, "make install failed"));
+        return Err(io::Error::other("make install failed"));
     }
 
     Ok(())
@@ -389,7 +808,9 @@ fn try_vcpkg(_statik: bool) -> Option<Vec<PathBuf>> {
 #[cfg(target_env = "msvc")]
 fn try_vcpkg(statik: bool) -> Option<Vec<PathBuf>> {
     if !statik {
-        env::set_var("VCPKGRS_DYNAMIC", "1");
+        unsafe {
+            env::set_var("VCPKGRS_DYNAMIC", "1");
+        }
     }
 
     vcpkg::find_package("ffmpeg")
@@ -408,13 +829,13 @@ fn check_features(
     let mut main_code = String::new();
 
     for &(header, feature, var) in infos {
-        if let Some(feature) = feature {
-            if env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err() {
-                continue;
-            }
+        if let Some(feature) = feature
+            && env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err()
+        {
+            continue;
         }
 
-        let include = format!("#include <{}>", header);
+        let include = format!("#include <{header}>");
         if !includes_code.contains(&include) {
             includes_code.push_str(&include);
             includes_code.push('\n');
@@ -430,19 +851,17 @@ fn check_features(
             #define {var}_is_defined 1
             #endif
             #endif
-        "#,
-            var = var
+        "#
         );
 
         let _ = write!(
             main_code,
             r#"printf("[{var}]%d%d\n", {var}, {var}_is_defined);
-            "#,
-            var = var
+            "#
         );
     }
 
-    let version_check_info = [("avcodec", 56, 61, 0, 108)];
+    let version_check_info = [("avcodec", 56, 64, 0, 108)];
     for &(lib, begin_version_major, end_version_major, begin_version_minor, end_version_minor) in
         version_check_info.iter()
     {
@@ -474,9 +893,7 @@ fn check_features(
                 {main_code}
                 return 0;
             }}
-           "#,
-        includes_code = includes_code,
-        main_code = main_code
+           "#
     )
     .expect("Write failed");
 
@@ -520,13 +937,17 @@ fn check_features(
     println!("stdout of {}={}", executable.display(), stdout);
 
     for &(_, feature, var) in infos {
-        if let Some(feature) = feature {
-            if env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err() {
-                continue;
-            }
+        if let Some(feature) = feature
+            && env::var(format!("CARGO_FEATURE_{}", feature.to_uppercase())).is_err()
+        {
+            continue;
         }
+        // Here so the features are listed for rust-ffmpeg at build time. Does
+        // NOT represent activated features, just features that exist (hence the
+        // lack of "=true" at the end)
+        println!(r#"cargo:{var}="#);
 
-        let var_str = format!("[{var}]", var = var);
+        let var_str = format!("[{var}]");
         let pos = var_str.len()
             + stdout
                 .find(&var_str)
@@ -552,12 +973,8 @@ fn check_features(
     {
         for version_major in begin_version_major..end_version_major {
             for version_minor in begin_version_minor..end_version_minor {
-                let search_str = format!(
-                    "[{lib}_version_greater_than_{version_major}_{version_minor}]",
-                    version_major = version_major,
-                    version_minor = version_minor,
-                    lib = lib
-                );
+                let search_str =
+                    format!("[{lib}_version_greater_than_{version_major}_{version_minor}]");
                 let pos = stdout
                     .find(&search_str)
                     .expect("Variable not found in output")
@@ -579,7 +996,7 @@ fn check_features(
         ("ffmpeg_3_1", 57, 48),
         ("ffmpeg_3_2", 57, 64),
         ("ffmpeg_3_3", 57, 89),
-        ("ffmpeg_3_1", 57, 107),
+        ("ffmpeg_3_4", 57, 107),
         ("ffmpeg_4_0", 58, 18),
         ("ffmpeg_4_1", 58, 35),
         ("ffmpeg_4_2", 58, 54),
@@ -588,6 +1005,12 @@ fn check_features(
         ("ffmpeg_5_0", 59, 18),
         ("ffmpeg_5_1", 59, 37),
         ("ffmpeg_6_0", 60, 3),
+        ("ffmpeg_6_1", 60, 31),
+        ("ffmpeg_7_0", 61, 3),
+        ("ffmpeg_7_1", 61, 19),
+        ("ffmpeg_8_0", 62, 8),
+        ("ffmpeg_8_1", 62, 28),
+        ("ffmpeg_9_0", 63, 1),
     ];
     for &(ffmpeg_version_flag, lavc_version_major, lavc_version_minor) in
         ffmpeg_lavc_versions.iter()
@@ -601,9 +1024,15 @@ fn check_features(
             .find(&search_str)
             .expect("Variable not found in output")
             + search_str.len();
+        println!(
+            r#"cargo:rustc-check-cfg=cfg(feature, values("{}"))"#,
+            ffmpeg_version_flag
+        );
         if &stdout[pos..pos + 1] == "1" {
-            println!(r#"cargo:rustc-cfg=feature="{}""#, ffmpeg_version_flag);
-            println!(r#"cargo:{}=true"#, ffmpeg_version_flag);
+            println!(r#"cargo:rustc-cfg=feature="{ffmpeg_version_flag}""#);
+            println!(r#"cargo:{ffmpeg_version_flag}=true"#);
+        } else {
+            println!(r#"cargo:{ffmpeg_version_flag}="#);
         }
     }
 }
@@ -612,10 +1041,14 @@ fn search_include(include_paths: &[PathBuf], header: &str) -> String {
     for dir in include_paths {
         let include = dir.join(header);
         if fs::metadata(&include).is_ok() {
-            return include.as_path().to_str().unwrap().to_string();
+            if let Some(path_str) = include.as_path().to_str() {
+                return path_str.to_string();
+            }
+            // Fall back to lossy conversion if path contains non-UTF8 characters
+            return include.to_string_lossy().to_string();
         }
     }
-    format!("/usr/include/{}", header)
+    format!("/usr/include/{header}")
 }
 
 fn maybe_search_include(include_paths: &[PathBuf], header: &str) -> Option<String> {
@@ -635,26 +1068,30 @@ fn link_to_libraries(statik: bool, target_os: &str) {
             println!("cargo:rustc-link-lib={}={}", ffmpeg_ty, lib.name);
         }
     }
-    if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os == "linux" {
+    println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+    if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os = "linux" {
         println!("cargo:rustc-link-lib=z");
     }
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=FFMPEG_DIR");
+
     let statik = env::var("CARGO_FEATURE_STATIC").is_ok();
     let ffmpeg_major_version: u32 = env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
 
+    let sysroot = find_sysroot();
     let include_paths: Vec<PathBuf> = if env::var("CARGO_FEATURE_BUILD").is_ok() {
         println!(
             "cargo:rustc-link-search=native={}",
             search().join("lib").to_string_lossy()
         );
         link_to_libraries(statik, &target_os);
-        if fs::metadata(&search().join("lib").join("libavutil.a")).is_err() {
-            fs::create_dir_all(&output()).expect("failed to create build directory");
+        if fs::metadata(search().join("lib").join("libavutil.a")).is_err() {
+            fs::create_dir_all(output()).expect("failed to create build directory");
             fetch().unwrap();
-            build().unwrap();
+            build(sysroot.as_deref()).unwrap();
         }
 
         // Check additional required libraries.
@@ -662,20 +1099,50 @@ fn main() {
             let config_mak = source().join("ffbuild/config.mak");
             let file = File::open(config_mak).unwrap();
             let reader = BufReader::new(file);
-            let extra_libs = reader
+            let extra_linker_args = reader
                 .lines()
-                .find(|line| line.as_ref().unwrap().starts_with("EXTRALIBS"))
-                .map(|line| line.unwrap())
-                .unwrap();
+                .filter_map(|line| {
+                    let line = line.as_ref().ok()?;
 
-            let linker_args = extra_libs.split('=').last().unwrap().split(' ');
-            let include_libs = linker_args
-                .filter(|v| v.starts_with("-l"))
-                .map(|flag| &flag[2..]);
+                    if line.starts_with("EXTRALIBS") {
+                        Some(
+                            line.split('=')
+                                .next_back()
+                                .unwrap()
+                                .split(' ')
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>(),
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .flatten()
+                .collect::<Vec<_>>();
 
-            for lib in include_libs {
-                println!("cargo:rustc-link-lib={}", lib);
-            }
+            extra_linker_args
+                .iter()
+                .filter(|flag| flag.starts_with("-l"))
+                .map(|lib| &lib[2..])
+                .for_each(|lib| println!("cargo:rustc-link-lib={lib}"));
+
+            extra_linker_args
+                .iter()
+                .filter(|v| v.starts_with("-L"))
+                .map(|flag| {
+                    let path = &flag[2..];
+                    if path.starts_with('/') {
+                        PathBuf::from(path)
+                    } else {
+                        source().join(path)
+                    }
+                })
+                .for_each(|lib_search_path| {
+                    println!(
+                        "cargo:rustc-link-search=native={}",
+                        lib_search_path.to_string_lossy()
+                    );
+                })
         }
 
         vec![search().join("include")]
@@ -683,10 +1150,33 @@ fn main() {
     // Use prebuilt library
     else if let Ok(ffmpeg_dir) = env::var("FFMPEG_DIR") {
         let ffmpeg_dir = PathBuf::from(ffmpeg_dir);
-        println!(
-            "cargo:rustc-link-search=native={}",
-            ffmpeg_dir.join("lib").to_string_lossy()
-        );
+        if ffmpeg_dir.join("lib/amd64").exists()
+            && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
+        {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                ffmpeg_dir.join("lib/amd64").to_string_lossy()
+            );
+        } else if ffmpeg_dir.join("lib/armhf").exists()
+            && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("arm")
+        {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                ffmpeg_dir.join("lib/armhf").to_string_lossy()
+            );
+        } else if ffmpeg_dir.join("lib/arm64").exists()
+            && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64")
+        {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                ffmpeg_dir.join("lib/arm64").to_string_lossy()
+            );
+        } else {
+            println!(
+                "cargo:rustc-link-search=native={}",
+                ffmpeg_dir.join("lib").to_string_lossy()
+            );
+        }
         link_to_libraries(statik, &target_os);
         vec![ffmpeg_dir.join("include")]
     } else if let Some(paths) = try_vcpkg(statik) {
@@ -701,7 +1191,7 @@ fn main() {
                 println!("cargo:rustc-link-lib=ws2_32");
             }
 
-            // avutil depdendencies
+            // avutil dependencies
             println!("cargo:rustc-link-lib=bcrypt");
             println!("cargo:rustc-link-lib=user32");
         }
@@ -710,10 +1200,23 @@ fn main() {
     }
     // Fallback to pkg-config
     else {
-        pkg_config::Config::new()
-            .statik(statik)
-            .probe("libavutil")
-            .unwrap();
+        let avutil_result = pkg_config::Config::new().statik(statik).probe("libavutil");
+
+        if let Err(e) = avutil_result {
+            eprintln!("error: FFmpeg not found.");
+            eprintln!();
+            eprintln!("FFmpeg libraries could not be found using any of the following methods:");
+            eprintln!("  1. FFMPEG_DIR environment variable (not set)");
+            eprintln!("  2. vcpkg package manager (ffmpeg package not found)");
+            eprintln!("  3. pkg-config (libavutil not found: {})", e);
+            eprintln!();
+            eprintln!("To fix this, please do one of the following:");
+            eprintln!("  - Set FFMPEG_DIR to point to your FFmpeg installation directory");
+            eprintln!("  - Install FFmpeg via vcpkg: vcpkg install ffmpeg");
+            eprintln!("  - Install FFmpeg and ensure pkg-config can find it");
+            eprintln!("  - Enable the 'build' feature to compile FFmpeg from source");
+            std::process::exit(1);
+        }
 
         let mut libs = vec![
             ("libavformat", "AVFORMAT"),
@@ -727,24 +1230,42 @@ fn main() {
         }
 
         for (lib_name, env_variable_name) in libs.iter() {
-            if env::var(format!("CARGO_FEATURE_{}", env_variable_name)).is_ok() {
-                pkg_config::Config::new()
-                    .statik(statik)
-                    .probe(lib_name)
-                    .unwrap();
+            if env::var(format!("CARGO_FEATURE_{env_variable_name}")).is_ok()
+                && let Err(e) = pkg_config::Config::new().statik(statik).probe(lib_name)
+            {
+                eprintln!("error: FFmpeg library {} not found: {}", lib_name, e);
+                eprintln!();
+                eprintln!(
+                    "The {} library is required but could not be found.",
+                    lib_name
+                );
+                eprintln!("Please ensure FFmpeg is installed with all required components.");
+                std::process::exit(1);
             }
         }
 
-        pkg_config::Config::new()
-            .statik(statik)
-            .probe("libavcodec")
-            .unwrap()
-            .include_paths
+        match pkg_config::Config::new().statik(statik).probe("libavcodec") {
+            Ok(lib) => lib.include_paths,
+            Err(e) => {
+                eprintln!("error: FFmpeg library libavcodec not found: {}", e);
+                eprintln!();
+                eprintln!("The libavcodec library is required but could not be found.");
+                eprintln!("Please ensure FFmpeg is installed with all required components.");
+                std::process::exit(1);
+            }
+        }
     };
 
-    if statik && target_os == "macos" {
+    if statik
+        && matches!(
+            env::var("CARGO_CFG_TARGET_OS").as_deref(),
+            Ok("macos") | Ok("ios") | Ok("tvos")
+        )
+    {
+        let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+
+        // Frameworks available on all Apple platforms (macOS, iOS, tvOS)
         let frameworks = vec![
-            "AppKit",
             "AudioToolbox",
             "AVFoundation",
             "CoreFoundation",
@@ -753,16 +1274,26 @@ fn main() {
             "CoreServices",
             "CoreVideo",
             "Foundation",
-            "OpenCL",
-            "OpenGL",
-            "QTKit",
             "QuartzCore",
             "Security",
-            "VideoDecodeAcceleration",
             "VideoToolbox",
         ];
-        for f in frameworks {
-            println!("cargo:rustc-link-lib=framework={}", f);
+        for f in &frameworks {
+            println!("cargo:rustc-link-lib=framework={f}");
+        }
+
+        // Frameworks only available on macOS
+        if target_os == "macos" {
+            let macos_frameworks = vec![
+                "AppKit",
+                "OpenCL",
+                "OpenGL",
+                "QTKit",
+                "VideoDecodeAcceleration",
+            ];
+            for f in &macos_frameworks {
+                println!("cargo:rustc-link-lib=framework={f}");
+            }
         }
     }
 
@@ -1072,10 +1603,25 @@ fn main() {
         .iter()
         .map(|include| format!("-I{}", include.to_string_lossy()));
 
+    println!("cargo:rerun-if-changed=hwcontext_wrapper.h");
+    println!("cargo:rerun-if-changed=hwcontext_stubs/vulkan/vulkan.h");
+    println!("cargo:rerun-if-changed=hwcontext_stubs/VideoToolbox/VideoToolbox.h");
+    println!("cargo:rerun-if-changed=hwcontext_stubs/va/va.h");
+    println!("cargo:rerun-if-changed=hwcontext_stubs/mfxvideo.h");
+    println!("cargo:rerun-if-changed=hwcontext_stubs/mfx/mfxvideo.h");
+
+    // SDK shims (vulkan/, VideoToolbox/, va/, mfxvideo.h) used by hwcontext_wrapper.h.
+    let hwcontext_stub_dir = format!(
+        "-I{}/hwcontext_stubs",
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR")
+    );
+
     // The bindgen::Builder is the main entry point
     // to bindgen, and lets you build up options for
     // the resulting bindings.
     let mut builder = bindgen::Builder::default()
+        // Shim dir first, so our stubs win over the real SDK headers on the path (by design, to avoid generating bindings for full SDKs).
+        .clang_arg(&hwcontext_stub_dir)
         .clang_args(clang_includes)
         .ctypes_prefix("libc")
         // https://github.com/rust-lang/rust-bindgen/issues/550
@@ -1170,9 +1716,14 @@ fn main() {
             non_exhaustive: env::var("CARGO_FEATURE_NON_EXHAUSTIVE_ENUMS").is_ok(),
         })
         .prepend_enum_name(false)
+        .wrap_unsafe_ops(true)
         .derive_eq(true)
         .size_t_is_usize(true)
         .parse_callbacks(Box::new(Callbacks));
+
+    if let Some(sysroot) = sysroot.as_deref() {
+        builder = builder.clang_arg(format!("--sysroot={sysroot}"));
+    }
 
     // The input headers we would like to generate
     // bindings for.
@@ -1180,11 +1731,20 @@ fn main() {
         builder = builder
             .header(search_include(&include_paths, "libavcodec/avcodec.h"))
             .header(search_include(&include_paths, "libavcodec/dv_profile.h"))
-            .header(search_include(&include_paths, "libavcodec/avfft.h"))
             .header(search_include(&include_paths, "libavcodec/vorbis_parser.h"));
 
+        let bsf_path = search_include(&include_paths, "libavcodec/bsf.h");
+        if std::path::Path::new(&bsf_path).exists() {
+            builder = builder.header(bsf_path);
+        }
+
         if ffmpeg_major_version < 5 {
-            builder = builder.header(search_include(&include_paths, "libavcodec/vaapi.h"))
+            builder = builder.header(search_include(&include_paths, "libavcodec/vaapi.h"));
+        }
+        if ffmpeg_major_version < 8
+            && let Some(avfft_path) = maybe_search_include(&include_paths, "libavcodec/avfft.h")
+        {
+            builder = builder.header(avfft_path);
         }
     }
 
@@ -1266,8 +1826,16 @@ fn main() {
         .header(search_include(&include_paths, "libavutil/avutil.h"))
         .header(search_include(&include_paths, "libavutil/xtea.h"));
 
+    let raw_color_params_path = search_include(&include_paths, "libavutil/raw_color_params.h");
+    if std::path::Path::new(&raw_color_params_path).exists() {
+        builder = builder.header(raw_color_params_path);
+    }
+
     if env::var("CARGO_FEATURE_POSTPROC").is_ok() {
-        builder = builder.header(search_include(&include_paths, "libpostproc/postprocess.h"));
+        let postproc_path = search_include(&include_paths, "libpostproc/postprocess.h");
+        if std::path::Path::new(&postproc_path).exists() {
+            builder = builder.header(postproc_path);
+        }
     }
 
     if env::var("CARGO_FEATURE_SWRESAMPLE").is_ok() {
@@ -1283,6 +1851,10 @@ fn main() {
     {
         builder = builder.header(hwcontext_drm_header);
     }
+
+    // Per-API hwcontext structs (CUDA, D3D11/12, VideoToolbox, MediaCodec,
+    // Vulkan, VAAPI, QSV) all bind through one wrapper.
+    builder = builder.header("hwcontext_wrapper.h");
 
     // Finish the builder and generate the bindings.
     let bindings = builder

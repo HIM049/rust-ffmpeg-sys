@@ -1,5 +1,5 @@
 [![ffmpeg-sys-next on crates.io](https://img.shields.io/crates/v/ffmpeg-sys-next?cacheSeconds=3600)](https://crates.io/crates/ffmpeg-sys-next)
-[![build](https://github.com/zmwangx/rust-ffmpeg-sys/workflows/build/badge.svg)](https://github.com/zmwangx/rust-ffmpeg-sys/actions)
+[![build](https://github.com/zmwangx/rust-ffmpeg-sys/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/zmwangx/rust-ffmpeg-sys/actions)
 
 This is a fork of the abandoned [ffmpeg-sys](https://github.com/meh/rust-ffmpeg-sys) crate. You can find this crate as [ffmpeg-sys-next](https://crates.io/crates/ffmpeg-sys-next) on crates.io.
 
@@ -17,12 +17,21 @@ In addition to feature flags declared in `Cargo.toml`, this crate performs vario
   - `ffmpeg_3_1`
   - `ffmpeg_3_2`
   - `ffmpeg_3_3`
-  - `ffmpeg_3_1`
+  - `ffmpeg_3_4`
   - `ffmpeg_4_0`
   - `ffmpeg_4_1`
   - `ffmpeg_4_2`
   - `ffmpeg_4_3`
   - `ffmpeg_4_4`
+  - `ffmpeg_5_0`
+  - `ffmpeg_5_1`
+  - `ffmpeg_6_0`
+  - `ffmpeg_6_1`
+  - `ffmpeg_7_0`
+  - `ffmpeg_7_1`
+  - `ffmpeg_8_0`
+  - `ffmpeg_8_1`
+  - `ffmpeg_9_0`
 
 - `avcodec_version_greater_than_<x>_<y>` (new in v4.3.2), e.g., `avcodec_version_greater_than_58_90`. The name should be self-explanatory.
 
