@@ -1069,7 +1069,7 @@ fn link_to_libraries(statik: bool, target_os: &str) {
         }
     }
     println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-    if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os = "linux" {
+    if env::var("CARGO_FEATURE_BUILD_ZLIB").is_ok() && target_os == "linux" {
         println!("cargo:rustc-link-lib=z");
     }
 }
