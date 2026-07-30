@@ -309,6 +309,52 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     if cfg!(target_os = "windows") {
         let path = env::var("PATH").unwrap_or_default();
         let mut paths = env::split_paths(&path).collect::<Vec<_>>();
+        // Configure checks cl.exe, but static FFmpeg also needs lib.exe. Discover
+        // the Visual Studio tool directory when Cargo was not launched by VsDevCmd.
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            let vc_tools = env::var_os("VCToolsInstallDir")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    let vswhere = PathBuf::from(env::var_os("ProgramFiles(x86)")?)
+                        .join("Microsoft Visual Studio")
+                        .join("Installer")
+                        .join("vswhere.exe");
+                    let output = Command::new(vswhere)
+                        .args(["-latest", "-products", "*", "-property", "installationPath"])
+                        .output()
+                        .ok()?;
+                    let install = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+                    fs::read_dir(install.join("VC").join("Tools").join("MSVC"))
+                        .ok()?
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .max()
+                });
+            if let Some(vc_tools) = vc_tools {
+                let bin_dir = vc_tools.join("bin").join("Hostx64").join("x64");
+                if bin_dir.join("lib.exe").is_file() {
+                    paths.insert(0, bin_dir);
+                }
+            }
+        }
+        // FFmpeg invokes `touch` directly, but VS developer shells do not ship it.
+        // Keep Git's sh.exe/awk.exe off PATH: mixing them with MinGW make breaks
+        // FFmpeg's dependency-generation quoting.
+        let tools_dir = output().join("ffmpeg-tools");
+        fs::create_dir_all(&tools_dir)?;
+        fs::write(
+            tools_dir.join("touch.cmd"),
+            "@copy /b \"%~1\"+,, >nul\r\n",
+        )?;
+        // MinGW make delegates recipes to sh.exe, which does not resolve .cmd.
+        fs::write(tools_dir.join("touch"), "#!/bin/sh\n: >> \"$1\"\n")?;
+        // FFmpeg also invokes rm directly while assembling static libraries.
+        fs::write(
+            tools_dir.join("rm.cmd"),
+            "@shift\r\n:delete\r\n@if \"%~1\"==\"\" exit /b 0\r\n@del /f /q \"%~1\" >nul 2>nul\r\n@shift\r\n@goto delete\r\n",
+        )?;
+        fs::write(tools_dir.join("rm"), "#!/bin/sh\nfor file in \"$@\"; do [ \"$file\" = -f ] || cmd.exe /c del /f /q \"$file\" 2>/dev/null; done\nexit 0\n")?;
+        paths.push(tools_dir);
         paths.push(source_dir.clone());
         let new_path = env::join_paths(paths).unwrap();
 
@@ -340,7 +386,7 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
 
         let mut configure = Command::new("sh");
         configure.arg(configure_path);
-        if cfg!(target_env = "msvc") {
+        if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
             configure.arg("--toolchain=msvc");
         }
 
@@ -349,11 +395,25 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         Command::new(&configure_path)
     };
 
+    // FFmpeg 8.1 emits a two-backslash awk expression for MSVC dependency
+    // files. GNU make consumes one level while expanding a recipe, leaving
+    // invalid awk syntax. Preserve the required escaping before configure.
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        let configure_script = source_dir.join("configure");
+        let contents = fs::read_to_string(&configure_script)?;
+        let patched = contents.replace(
+            r#"gsub(/\\/, "/")"#,
+            r#"gsub(/\\\\/, "/")"#,
+        );
+        fs::write(configure_script, patched)?;
+    }
+
     configure.current_dir(&source_dir);
     configure.arg(format!("--prefix={}", search().to_string_lossy()));
 
     let target = env::var("TARGET").unwrap();
     let host = env::var("HOST").unwrap();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap();
     if target != host {
         configure.arg("--enable-cross-compile");
 
@@ -392,7 +452,7 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
                 );
             }
         }
-    } else {
+    } else if target_env != "msvc" {
         // Determine -march/-mtune flags for the compiler.
         // Priority: env vars > build-portable feature > default (native)
         println!("cargo:rerun-if-env-changed=FFMPEG_MARCH");
@@ -527,9 +587,8 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     // make it static
     configure.arg("--enable-static");
     configure.arg("--disable-shared");
-    // windows includes threading in the standard library
-    #[cfg(not(target_env = "msvc"))]
-    {
+    // FFmpeg selects w32threads on Windows; forcing pthreads skips that backend.
+    if target_os != "windows" {
         configure.arg("--enable-pthreads");
     }
 
@@ -776,14 +835,30 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         )));
     }
 
-    // run make
-    if !Command::new("make")
+    // GNU make on Windows can execute the response-file recipe without a shell.
+    // Write it with make's built-in function to avoid shell parsing and cmd limits.
+    if target_env == "msvc" {
+        let library_mak = source_dir.join("ffbuild").join("library.mak");
+        let contents = fs::read_to_string(&library_mak)?;
+        let patched = contents.replace(
+            "$(Q)echo $^ > $@.objs",
+            "$(file >$@.objs,$^)",
+        );
+        fs::write(library_mak, patched)?;
+    }
+
+    // Run make. Cargo only reports build-script stdout on failure, so retain
+    // the diagnostic tails from its child process instead of dropping them.
+    let make_output = Command::new("make")
         .arg("-j")
         .arg(num_cpus::get().to_string())
         .current_dir(source())
-        .status()?
-        .success()
-    {
+        .output()?;
+    if !make_output.status.success() {
+        let stdout = String::from_utf8_lossy(&make_output.stdout);
+        let stderr = String::from_utf8_lossy(&make_output.stderr);
+        println!("make stdout tail:{}", stdout.lines().rev().take(80).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+        println!("make stderr tail:{}", stderr.lines().rev().take(160).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
         return Err(io::Error::other("make failed"));
     }
 
